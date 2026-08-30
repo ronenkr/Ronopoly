@@ -50,6 +50,37 @@ function Invoke-TestClick {
     $Button.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
 }
 
+Describe 'Player colours' {
+
+    It 'picks readable ink for every token colour' {
+        # The trade panels put a player's name on their own token colour, so
+        # every one of those colours has to end up with legible text on it.
+        # Contrast ratio per WCAG, which is a real threshold rather than a
+        # guess: 4.5:1 is the readable-body-text line.
+        $luminance = {
+            param([string]$hex)
+            $h = $hex.TrimStart('#')
+            $parts = @(0, 2, 4) | ForEach-Object {
+                $c = [Convert]::ToInt32($h.Substring($_, 2), 16) / 255.0
+                if ($c -le 0.03928) { $c / 12.92 } else { [math]::Pow((($c + 0.055) / 1.055), 2.4) }
+            }
+            return (0.2126 * $parts[0] + 0.7152 * $parts[1] + 0.0722 * $parts[2])
+        }
+
+        $tokens = Get-RonTokens
+        foreach ($id in $tokens.Order) {
+            $colour = [string]$tokens.Tokens[$id].Colour
+            $ink = Get-RonContrastInk $colour
+            $a = & $luminance $colour
+            $b = & $luminance $ink
+            $hi = [math]::Max($a, $b)
+            $lo = [math]::Min($a, $b)
+            $ratio = ($hi + 0.05) / ($lo + 0.05)
+            Assert-True ($ratio -ge 4.5) ("$id ($colour) got ink $ink at only {0:N1}:1" -f $ratio)
+        }
+    }
+}
+
 Describe 'UI smoke' {
 
     It 'plays real turns in a real window with no logged errors' {

@@ -216,6 +216,20 @@ hardest problem in PowerShell + WPF work: a scriptblock handed to
 and fails intermittently with *"There is no Runspace available to run scripts in
 this thread"*.
 
+### Who owns what
+
+The trade panels put each player's name on their own token colour — the chip
+you pick to trade with, and the heading over each column of deeds. Which pile
+belongs to whom is the thing a trade panel is *about*, and a name in the same
+grey as everything else sends you back to the board to work it out.
+
+The text colour on those chips is measured, not guessed. A lightness threshold
+picked by eye put white on the blue token, where it manages only 4.2:1 — under
+the 4.5:1 that counts as readable — while black clears it at 5.0:1. The ink is
+now chosen by computing the actual WCAG contrast ratio, and a test asserts
+every token colour clears the bar, which is how that was found in the first
+place.
+
 ### The sound
 
 There is no audio to ship. Every effect is arithmetic — noise through a

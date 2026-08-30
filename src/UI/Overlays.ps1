@@ -191,20 +191,50 @@ function Get-RonCardMaxHeight {
     return $cap
 }
 
-# Black text on a light colour, white on a dark one.
-#
-# sRGB luminance rather than a plain average of the channels: the eye weights
-# green about ten times as heavily as blue, and averaging puts white text on
-# the amber token, where it is barely readable.
-function Get-RonContrastInk {
+# WCAG relative luminance: gamma-corrected per channel, then weighted by how
+# much the eye actually gets from each. Green carries roughly ten times what
+# blue does, and the correction is not linear, so neither the raw bytes nor
+# their plain average will do.
+function Get-RonRelativeLuminance {
     param([Parameter(Mandatory)][string]$Hex)
     $h = $Hex.TrimStart('#')
-    if ($h.Length -lt 6) { return '#FFFFFF' }
-    $r = [Convert]::ToInt32($h.Substring(0, 2), 16)
-    $g = [Convert]::ToInt32($h.Substring(2, 2), 16)
-    $b = [Convert]::ToInt32($h.Substring(4, 2), 16)
-    $lum = (0.2126 * $r + 0.7152 * $g + 0.0722 * $b) / 255.0
-    if ($lum -gt 0.55) { return '#101418' }
+    if ($h.Length -lt 6) { return 0.0 }
+    $weights = @(0.2126, 0.7152, 0.0722)
+    $lum = 0.0
+    for ($i = 0; $i -lt 3; $i++) {
+        $c = [Convert]::ToInt32($h.Substring($i * 2, 2), 16) / 255.0
+        if ($c -le 0.03928) { $lin = $c / 12.92 }
+        else { $lin = [math]::Pow((($c + 0.055) / 1.055), 2.4) }
+        $lum += $weights[$i] * $lin
+    }
+    return $lum
+}
+
+function Get-RonContrastRatio {
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    $la = Get-RonRelativeLuminance $A
+    $lb = Get-RonRelativeLuminance $B
+    $hi = [math]::Max($la, $lb)
+    $lo = [math]::Min($la, $lb)
+    return (($hi + 0.05) / ($lo + 0.05))
+}
+
+# Black text or white, whichever is actually more readable on this colour.
+#
+# Measured rather than guessed at with a lightness threshold, because the
+# answer is not obvious: on the blue token white manages only 4.2:1 - under the
+# 4.5:1 that counts as readable - while black clears it at 5.0:1. A threshold
+# picked by eye chose white for exactly the colours where it is worst.
+function Get-RonContrastInk {
+    param([Parameter(Mandatory)][string]$Hex)
+    # The softer near-black looks better on a chip than pure black and clears
+    # the bar on most colours, so it is tried first. A mid-tone like the blue
+    # token defeats both it AND white - 4.4:1 and 4.2:1 - and only pure black
+    # gets over the line there. Legible beats handsome.
+    foreach ($ink in @('#101418', '#FFFFFF')) {
+        if ((Get-RonContrastRatio $Hex $ink) -ge 4.5) { return $ink }
+    }
+    if ((Get-RonContrastRatio $Hex '#000000') -ge (Get-RonContrastRatio $Hex '#FFFFFF')) { return '#000000' }
     return '#FFFFFF'
 }
 
@@ -234,18 +264,35 @@ function New-RonPlayerChip {
     return $chip
 }
 
-# What the trade-with box binds to. Brushes rather than colour strings so the
-# template needs no conversion, and frozen so one brush can be shared by every
-# copy the ComboBox makes.
-function New-RonPlayerListItem {
-    param([Parameter(Mandatory)][GameState]$State, [Parameter(Mandatory)][int]$PlayerId)
+# A player as a pickable chip: their colour, their name, and a ring round the
+# one currently chosen.
+function New-RonPlayerButton {
+    param(
+        [Parameter(Mandatory)][hashtable]$Ui,
+        [Parameter(Mandatory)][GameState]$State,
+        [Parameter(Mandatory)][int]$PlayerId,
+        [bool]$Selected = $false
+    )
     $colour = Get-RonPlayerColour -State $State -PlayerId $PlayerId
-    return [pscustomobject]@{
-        Id     = $PlayerId
-        Name   = $State.Players[$PlayerId].Name
-        Swatch = (New-RonBrush $colour)
-        Ink    = (New-RonBrush (Get-RonContrastInk $colour))
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = $State.Players[$PlayerId].Name
+    $btn.Background = New-RonBrush $colour
+    $btn.Foreground = New-RonBrush (Get-RonContrastInk $colour)
+    $btn.Padding = New-Object System.Windows.Thickness(15, 5, 15, 6)
+    $btn.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+    $btn.BorderThickness = New-Object System.Windows.Thickness 2
+    if ($Selected) {
+        $btn.BorderBrush = $Ui.Window.FindResource('Brush.Text')
+        $btn.Opacity = 1.0
     }
+    else {
+        # Dimmed enough to read as "not this one", not so far that the name
+        # stops being legible - the chip has to stay a label as well as a
+        # button.
+        $btn.BorderBrush = New-RonBrush $colour
+        $btn.Opacity = 0.62
+    }
+    return $btn
 }
 
 # A heading with a player chip beside it: "YOU GIVE   [Ada]".
@@ -765,31 +812,18 @@ function Show-RonTradeOverlay {
     }
     $card = New-RonOverlayCard -Ui $Ui -Title $title -Subtitle $subtitle -Width 900
 
-    $picker = New-RonRowGrid -Widths @('Auto','*')
-    $picker.Children.Add((New-RonLabel -Text 'Trade with' -Column 0)) | Out-Null
-    $combo = New-Object System.Windows.Controls.ComboBox
-    $combo.Margin = New-Object System.Windows.Thickness(12, 0, 0, 0)
-    $combo.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
-    $combo.MinWidth = 220
-    # A DATA template rather than chips built here, and that is not a style
-    # choice: a ComboBox shows the selected item twice - once in the list and
-    # once in the closed box - and a single visual cannot have two parents.
-    # Handing WPF a template lets it build one for each place.
-    $combo.ItemTemplate = ConvertFrom-RonXaml @"
-<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
-  <Border CornerRadius="6" Padding="9,2,9,3" Background="{Binding Swatch}">
-    <TextBlock Text="{Binding Name}" Foreground="{Binding Ink}" FontWeight="SemiBold" FontSize="14" />
-  </Border>
-</DataTemplate>
-"@
-    foreach ($id in $others) { [void]$combo.Items.Add((New-RonPlayerListItem -State $State -PlayerId $id)) }
-    $combo.SelectedIndex = [array]::IndexOf($others, $ctx.ToId)
-    if ($combo.SelectedIndex -lt 0) { $combo.SelectedIndex = 0 }
-    # A counter answers ONE player; letting the box change who it goes to would
-    # silently turn it back into an ordinary proposal.
-    if ($isCounter) { $combo.IsEnabled = $false }
-    [System.Windows.Controls.Grid]::SetColumn($combo, 1)
-    [void]$picker.Children.Add($combo)
+    # Who to trade with, as one chip per player in their own colour rather than
+    # a dropdown. With at most seven of them there is nothing to gain by hiding
+    # the choice behind a click, and showing every colour at once is the point
+    # of colouring them at all.
+    $picker = New-Object System.Windows.Controls.StackPanel
+    $picker.Orientation = [System.Windows.Controls.Orientation]::Horizontal
+    $pickerLabel = New-RonLabel -Text 'Trade with'
+    $pickerLabel.Margin = New-Object System.Windows.Thickness(0, 0, 12, 0)
+    [void]$picker.Children.Add($pickerLabel)
+    $pickerHost = New-Object System.Windows.Controls.WrapPanel
+    $pickerHost.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+    [void]$picker.Children.Add($pickerHost)
     [void]$card.Body.Children.Add($picker)
 
     $columns = New-RonRowGrid -Widths @('*','*')
@@ -812,7 +846,7 @@ function Show-RonTradeOverlay {
     $good = $Ui.Window.FindResource('Brush.Good')
     $bad  = $Ui.Window.FindResource('Brush.Danger')
     $dim  = $Ui.Window.FindResource('Brush.TextDim')
-    $state = @{ Button = $null }
+    $state = @{ Button = $null; Picker = $null }
 
     # Three different things the line can say, and they are not the same thing:
     # nothing offered yet, offered but against the rules, and legal but a deal
@@ -874,14 +908,35 @@ function Show-RonTradeOverlay {
         & $refresh
     }.GetNewClosure()
 
-    $combo.Add_SelectionChanged({
-        if ($combo.SelectedIndex -lt 0) { return }
-        $ctx.ToId = $others[$combo.SelectedIndex]
-        $ctx.Get.Clear()
-        $ctx.GetCash = 0
-        $ctx.GetJail = 0
-        & $rebuild
-    }.GetNewClosure())
+    # Redrawn rather than restyled, because which chip is chosen is the only
+    # thing that changes and a handful of buttons is nothing to rebuild.
+    $renderPicker = {
+        $st = (Get-RonApp).State
+        $pickerHost.Children.Clear()
+        if ($isCounter) {
+            # A counter answers ONE player; offering to change who it goes to
+            # would silently turn it back into an ordinary proposal.
+            [void]$pickerHost.Children.Add((New-RonPlayerChip -Ui $Ui -State $st -PlayerId $ctx.ToId))
+            return
+        }
+        foreach ($id in $others) {
+            $btn = New-RonPlayerButton -Ui $Ui -State $st -PlayerId $id -Selected ($id -eq $ctx.ToId)
+            $pick = $id
+            $btn.Add_Click({
+                if ($ctx.ToId -eq $pick) { return }
+                $ctx.ToId = $pick
+                # What they were going to give is meaningless against a
+                # different player, so that side starts again.
+                $ctx.Get.Clear()
+                $ctx.GetCash = 0
+                $ctx.GetJail = 0
+                & $state.Picker
+                & $rebuild
+            }.GetNewClosure())
+            [void]$pickerHost.Children.Add($btn)
+        }
+    }.GetNewClosure()
+    $state.Picker = $renderPicker
 
     $sendLabel = 'Offer trade'
     if ($isCounter) { $sendLabel = 'Send counter-offer' }
@@ -911,6 +966,7 @@ function Show-RonTradeOverlay {
         } | Out-Null
     }
 
+    & $renderPicker
     & $rebuild
     Show-RonOverlay -Ui $Ui -Content $card.Root -Modal
 }

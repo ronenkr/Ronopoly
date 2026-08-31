@@ -24,6 +24,10 @@ function Start-RonApp {
         [int]$Port = 0,
         [string]$PlayerName = 'Player',
         [switch]$LoopbackOnly,
+        # How many seats to leave open for people joining over the network.
+        # Without at least one, a hosted game answers every joiner with "this
+        # game is full" - there is nowhere for them to sit.
+        [int]$RemoteSeats = 0,
         [switch]$FastMode,
         [switch]$Mute,
         # Close the window automatically after N seconds. Used by the UI
@@ -39,7 +43,7 @@ function Start-RonApp {
 
     Initialize-RonAssets
     Initialize-RonAudio -Muted:$Mute
-    if ($null -eq $Seats) { $Seats = New-RonDefaultSeats }
+    if ($null -eq $Seats) { $Seats = New-RonDefaultSeats -Remote $RemoteSeats }
     if ($null -eq $Rules) { $Rules = Get-RonDefaultRules }
 
     $window = ConvertFrom-RonXaml (Get-RonMainWindowXaml)
@@ -58,6 +62,9 @@ function Start-RonApp {
         AiTimer  = $null
         NetTimer = $null
         Mode     = $Mode
+        # What a seat looked like before it was opened to the network, so it
+        # can be handed back to the bot it was taken from.
+        OpenedSeats = @{}
         # Set only by the quit panel. Window.Closing cancels every close that
         # does not carry it, which is what turns the X into a question.
         ConfirmedClose = $false
@@ -162,7 +169,7 @@ function New-RonUiIndex {
     param([Parameter(Mandatory)][System.Windows.Window]$Window)
     $names = @(
         'RootGrid','BoardRoot','BoardGrid','OrnamentCanvas','TokenCanvas',
-        'TurnText','PhaseText','PromptText','BankText','NetText',
+        'TurnText','PhaseText','PromptText','BankText','BtnNet',
         'DiceHost','ActionPanel','PlayerList','LogList','LogScroll',
         'OverlayLayer','OverlayScrim','OverlayHost','ToastLayer','ToastHost',
         'BtnSave','BtnRules','BtnSound','BtnTheme','BtnNewGame'
@@ -171,6 +178,7 @@ function New-RonUiIndex {
     foreach ($n in $names) { $ui[$n] = $Window.FindName($n) }
     $ui.HighlightIndex = -1
     $ui.Modal = $false
+    $ui.NetPanelOpen = $false
     return $ui
 }
 
@@ -185,6 +193,7 @@ function Register-RonUiHandlers {
     })
 
     $ui.BtnNewGame.Add_Click({ Show-RonNewGameOverlay })
+    $ui.BtnNet.Add_Click({ Show-RonNetworkOverlay })
     $ui.BtnRules.Add_Click({ Show-RonRulesOverlay })
     $ui.BtnSave.Add_Click({ Show-RonSaveOverlay })
 
@@ -266,7 +275,8 @@ function Start-RonNewGame {
     $App.Rules = $Rules
     $App.State = $state
     $App.Session = New-RonLocalSession -State $state
-    $App.Ui.NetText.Text = 'Local game'
+    $App.OpenedSeats = @{}
+    Set-RonNetStatus
 
     Reset-RonGameView
     Add-RonLogLine -Ui $App.Ui -Text ("New game - " + (@($Seats | ForEach-Object { $_.Name }) -join ', '))
@@ -297,7 +307,7 @@ function Start-RonHostedGame {
     $App.Rules = $Rules
     $App.State = $state
     $App.Session = $session
-    $App.Ui.NetText.Text = Get-RonHostSummary -Session $session
+    Set-RonNetStatus
 
     Reset-RonGameView
     Add-RonLogLine -Ui $App.Ui -Text (Get-RonHostSummary -Session $session) -Colour '#2FBF71'
@@ -319,7 +329,7 @@ function Start-RonJoinedGame {
         return
     }
     $App.Session = $session
-    $App.Ui.NetText.Text = "Joining ${HostAddress}..."
+    Set-RonNetStatus -Text "Joining ${HostAddress}..."
     Add-RonLogLine -Ui $App.Ui -Text "Connecting to $HostAddress..."
 }
 
@@ -339,6 +349,129 @@ function Reset-RonGameView {
     [void](Initialize-RonDiceView -Ui $App.Ui)
     [void](Initialize-RonHudView -Ui $App.Ui -State $App.State)
     Update-RonAllViews
+}
+
+# --- the network, from inside a running game --------------------------------
+#
+# A game does not have to be started with -Mode Host. These are what the status
+# strip's button drives: a local game becomes a hosted one over the same
+# GameState, mid-turn, with nothing restarted and nobody's position lost.
+
+# The status strip's caption. Derived from the session rather than remembered,
+# so it cannot drift out of step with what is actually happening.
+function Set-RonNetStatus {
+    param([string]$Text = '')
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.Ui.BtnNet) { return }
+
+    $kind = 'Local'
+    if ($null -ne $App.Session) { $kind = [string]$App.Session.Kind }
+
+    if (-not $Text) {
+        if ($kind -eq 'Host') { $Text = Get-RonHostSummary -Session $App.Session }
+        else                  { $Text = 'Local game' }
+    }
+    $tip = 'Who else is in this game.'
+    if ($kind -eq 'Local') {
+        # The affordance has to be in the caption. A button that says only
+        # "Local game" is a button nobody presses, and the whole network layer
+        # stays undiscovered behind it.
+        $Text += '   -   Invite'
+        $tip = 'Open this game to other people on your network.'
+    }
+    $App.Ui.BtnNet.Content = $Text
+    $App.Ui.BtnNet.ToolTip = $tip
+}
+
+# Opens the running game to the network, handing the chosen seats to whoever
+# joins. Returns @{ Ok; Reason }.
+function Open-RonAppToNetwork {
+    param([int[]]$SeatIds = @(), [int]$Port = 0, [switch]$LoopbackOnly)
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.State) { return @{ Ok = $false; Reason = 'No game is running.' } }
+    if ($null -eq $App.Session -or $App.Session.Kind -ne 'Local') {
+        return @{ Ok = $false; Reason = 'This game is already on the network.' }
+    }
+
+    $taken = New-Object System.Collections.ArrayList
+    foreach ($id in @($SeatIds)) { [void]$taken.Add((Open-RonRemoteSeat -State $App.State -PlayerId $id)) }
+
+    $session = Open-RonSessionToNetwork -Session $App.Session -Port $Port -LoopbackOnly:$LoopbackOnly
+    if ($session.Kind -eq 'Failed') {
+        # Hosting failed, so the game has to be exactly the game it was - not
+        # one with holes in it where the bots used to be.
+        foreach ($snap in $taken) { [void](Restore-RonSeat -State $App.State -Snapshot $snap) }
+        return @{ Ok = $false; Reason = [string]$session.Error }
+    }
+
+    foreach ($snap in $taken) { $App.OpenedSeats[[int]$snap.Id] = $snap }
+    $App.Session = $session
+    $App.Mode = 'Host'
+    Set-RonNetStatus
+    Add-RonLogLine -Ui $App.Ui -Text (Get-RonHostSummary -Session $session) -Colour '#2FBF71'
+    Update-RonAllViews
+    return @{ Ok = $true; Reason = '' }
+}
+
+# Opens one more seat on a game that is already hosted.
+function Open-RonAppSeat {
+    param([Parameter(Mandatory)][int]$PlayerId)
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.Session -or $App.Session.Kind -ne 'Host') {
+        return @{ Ok = $false; Reason = 'This game is not open to the network.' }
+    }
+    $App.OpenedSeats[$PlayerId] = (Open-RonRemoteSeat -State $App.State -PlayerId $PlayerId)
+    $App.Session.LocalIds = Get-RonHostLocalIds -State $App.State
+    Set-RonNetStatus
+    Update-RonAllViews
+    Start-RonAutoPlay
+    return @{ Ok = $true; Reason = '' }
+}
+
+# Takes a still-unclaimed seat back off the table. Only ever offered for a seat
+# nobody has joined on - dropping a player who is sitting there would be a very
+# different button, and it is not this one.
+function Close-RonAppSeat {
+    param([Parameter(Mandatory)][int]$PlayerId)
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.State) { return @{ Ok = $false; Reason = 'No game is running.' } }
+    $player = $App.State.Players[$PlayerId]
+    if ($player.ConnectionState -eq 'Connected') {
+        return @{ Ok = $false; Reason = "$($player.Name) is playing from another computer." }
+    }
+    if (-not $App.OpenedSeats.ContainsKey($PlayerId)) {
+        return @{ Ok = $false; Reason = 'That seat was open before this game started.' }
+    }
+    [void](Restore-RonSeat -State $App.State -Snapshot $App.OpenedSeats[$PlayerId])
+    $App.OpenedSeats.Remove($PlayerId)
+    if ($App.Session.Kind -eq 'Host') { $App.Session.LocalIds = Get-RonHostLocalIds -State $App.State }
+    Set-RonNetStatus
+    Update-RonAllViews
+    Start-RonAutoPlay
+    return @{ Ok = $true; Reason = '' }
+}
+
+# Stops listening and goes back to a game on this machine alone, putting every
+# seat that was opened back the way it was found.
+function Close-RonAppNetwork {
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.Session -or $App.Session.Kind -ne 'Host') {
+        return @{ Ok = $false; Reason = 'This game is not open to the network.' }
+    }
+    foreach ($p in $App.State.Players) {
+        if ($p.Kind -eq 'Remote' -and $p.ConnectionState -eq 'Connected') {
+            return @{ Ok = $false; Reason = "$($p.Name) is still playing from another computer." }
+        }
+    }
+    foreach ($id in @($App.OpenedSeats.Keys)) { [void](Restore-RonSeat -State $App.State -Snapshot $App.OpenedSeats[$id]) }
+    $App.OpenedSeats = @{}
+    $App.Session = Close-RonSessionNetwork -Session $App.Session
+    $App.Mode = 'Solo'
+    Set-RonNetStatus
+    Add-RonLogLine -Ui $App.Ui -Text 'Closed the game to the network.'
+    Update-RonAllViews
+    Start-RonAutoPlay
+    return @{ Ok = $true; Reason = '' }
 }
 
 # --- the per-frame refresh -------------------------------------------------
@@ -433,7 +566,7 @@ function Invoke-RonNetTick {
     foreach ($notice in (Step-RonSession -Session $App.Session)) {
         switch ($notice.Kind) {
             'Welcome' {
-                $App.Ui.NetText.Text = "Connected as seat $($notice.PlayerId)"
+                Set-RonNetStatus -Text "Connected as seat $($notice.PlayerId)"
             }
             'Resync' {
                 $App.State = $notice.State
@@ -450,19 +583,22 @@ function Invoke-RonNetTick {
             }
             'Joined' {
                 Add-RonLogLine -Ui $App.Ui -Text "$($notice.Name) joined." -Colour '#2FBF71'
-                $App.Ui.NetText.Text = Get-RonHostSummary -Session $App.Session
+                Set-RonNetStatus
                 Update-RonAllViews
+                Sync-RonNetworkOverlay
             }
             'Disconnected' {
                 Add-RonLogLine -Ui $App.Ui -Text (Get-RonString 'Ui.AiTakeover' $notice.Name) -Colour '#F0553C'
                 # The seat is handed to the AI so the game continues rather than
                 # stalling; reconnecting within the game reclaims it.
                 Set-RonAiTakeover -Session $App.Session -PlayerId $notice.PlayerId
+                Set-RonNetStatus
                 Update-RonAllViews
+                Sync-RonNetworkOverlay
                 Start-RonAutoPlay
             }
             'HostLost' {
-                $App.Ui.NetText.Text = 'Host lost'
+                Set-RonNetStatus -Text 'Host lost'
                 Show-RonMessageOverlay -Title 'Connection lost' -Body @('The host is no longer reachable.', $notice.Reason)
             }
             'Rejected' {
@@ -490,7 +626,8 @@ function Resume-RonSavedGame {
     $App.State = $State
     $App.Rules = $State.Rules
     $App.Session = New-RonLocalSession -State $State
-    $App.Ui.NetText.Text = 'Local game'
+    $App.OpenedSeats = @{}
+    Set-RonNetStatus
     Reset-RonGameView
     Add-RonLogLine -Ui $App.Ui -Text "Loaded a saved game at turn $($State.Turn.TurnNumber)." -Colour '#2FBF71'
     Start-RonAutoPlay

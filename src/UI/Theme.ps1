@@ -172,6 +172,18 @@ function Get-RonThemeXaml {
     <Setter Property="Margin"   Value="4,0,0,0" />
   </Style>
 
+  <!-- The network status strip: reads as text until you point at it, then
+       reads as the button it has been all along. -->
+  <Style x:Key="Button.Status" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+    <Setter Property="Background"      Value="Transparent" />
+    <Setter Property="Foreground"      Value="{DynamicResource Brush.TextDim}" />
+    <Setter Property="BorderBrush"     Value="Transparent" />
+    <Setter Property="FontSize"        Value="14" />
+    <Setter Property="FontWeight"      Value="Normal" />
+    <Setter Property="Padding"         Value="8,3" />
+    <Setter Property="Margin"          Value="0" />
+  </Style>
+
   <Style TargetType="TextBox">
     <Setter Property="Foreground"      Value="{DynamicResource Brush.Text}" />
     <Setter Property="Background"      Value="{DynamicResource Brush.PanelAlt}" />

@@ -119,15 +119,17 @@ function Get-RonMainWindowXaml {
           </Grid>
         </Border>
 
+        <!-- Stacked rather than side by side: "Hosting on 192.168.1.42:27015 -
+             waiting for 2 player(s)" and the bank's stock were competing for
+             one row, and the bank was losing the end of its sentence. -->
         <Border Grid.Row="3" Style="{DynamicResource Card}" Margin="0,12,0,0" Padding="14,10">
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*" />
-              <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
-            <TextBlock Grid.Column="0" x:Name="BankText" Style="{DynamicResource Text.Dim}" />
-            <TextBlock Grid.Column="1" x:Name="NetText"  Style="{DynamicResource Text.Dim}" />
-          </Grid>
+          <StackPanel>
+            <TextBlock x:Name="BankText" Style="{DynamicResource Text.Dim}" Margin="8,0,0,0" />
+            <!-- Not a label. A local game has nothing else on screen that says
+                 other people could join it, so the status IS the way in. -->
+            <Button x:Name="BtnNet" Style="{DynamicResource Button.Status}"
+                    HorizontalAlignment="Left" HorizontalContentAlignment="Left" Margin="0,4,0,0" />
+          </StackPanel>
         </Border>
       </Grid>
     </Grid>

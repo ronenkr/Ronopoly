@@ -102,7 +102,14 @@ function Update-RonHudView {
         if ($p.Kind -eq 'AI') { [void]$bits.Add($p.AiProfile) }
         if ($p.InJail) { [void]$bits.Add('IN JAIL') }
         if ($p.ConnectionState -eq 'Disconnected') { [void]$bits.Add('disconnected') }
-        if ($p.ConnectionState -eq 'AiTakeover')   { [void]$bits.Add('AI takeover') }
+        if ($p.ConnectionState -eq 'AiTakeover') {
+            # A seat opened for somebody who has not arrived yet and a seat
+            # somebody walked away from look identical in the state. The
+            # session token is the difference: only a player who actually
+            # joined was ever given one.
+            if ($p.SessionToken) { [void]$bits.Add('AI takeover') }
+            else                 { [void]$bits.Add('open seat') }
+        }
         $card.Detail.Text = ($bits.ToArray() -join '  -  ')
 
         if ($p.IsBankrupt) {

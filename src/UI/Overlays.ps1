@@ -40,6 +40,7 @@ function Hide-RonOverlay {
     param([Parameter(Mandatory)][hashtable]$Ui)
     $wasModal = [bool]$Ui.Modal
     $Ui.Modal = $false
+    $Ui.NetPanelOpen = $false
     $Ui.OverlayLayer.Visibility = [System.Windows.Visibility]::Collapsed
     $Ui.OverlayHost.Content = $null
 
@@ -911,6 +912,14 @@ function Show-RonTradeOverlay {
     # Redrawn rather than restyled, because which chip is chosen is the only
     # thing that changes and a handful of buttons is nothing to rebuild.
     $renderPicker = {
+        # GetNewClosure copies the variables LOCAL to the scope it is called
+        # from. This scriptblock is ITSELF a closure, so the things it was
+        # built with belong to its own module rather than to this invocation -
+        # and a handler created below would capture none of them and read
+        # $null. Local aliases are something GetNewClosure can see and copy.
+        $offer = $ctx
+        $holder = $state
+        $redraw = $rebuild
         $st = (Get-RonApp).State
         $pickerHost.Children.Clear()
         if ($isCounter) {
@@ -923,15 +932,15 @@ function Show-RonTradeOverlay {
             $btn = New-RonPlayerButton -Ui $Ui -State $st -PlayerId $id -Selected ($id -eq $ctx.ToId)
             $pick = $id
             $btn.Add_Click({
-                if ($ctx.ToId -eq $pick) { return }
-                $ctx.ToId = $pick
+                if ($offer.ToId -eq $pick) { return }
+                $offer.ToId = $pick
                 # What they were going to give is meaningless against a
                 # different player, so that side starts again.
-                $ctx.Get.Clear()
-                $ctx.GetCash = 0
-                $ctx.GetJail = 0
-                & $state.Picker
-                & $rebuild
+                $offer.Get.Clear()
+                $offer.GetCash = 0
+                $offer.GetJail = 0
+                & $holder.Picker
+                & $redraw
             }.GetNewClosure())
             [void]$pickerHost.Children.Add($btn)
         }
@@ -1250,7 +1259,7 @@ function Show-RonNewGameOverlay {
     $Ui = $App.Ui
     $tokens = (Get-RonTokens).Order
     $names = @('You','Ada','Blake','Cleo','Dax','Esme','Fox','Gwen')
-    $kinds = @('Human','AI','Off')
+    $kinds = @('Human','AI','Remote','Off')
     $profiles = Get-RonAiProfileNames
 
     $card = New-RonOverlayCard -Ui $Ui -Title 'New game' `
@@ -1469,6 +1478,353 @@ function Show-RonSaveOverlay {
     }.GetNewClosure() | Out-Null
 
     Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Close' -OnClick {
+        Hide-RonOverlay -Ui (Get-RonApp).Ui
+    } | Out-Null
+
+    Show-RonOverlay -Ui $Ui -Content $card.Root -Modal
+}
+
+# --- the network -----------------------------------------------------------
+#
+# What the status strip under the game log opens. That strip is a BUTTON rather
+# than a label because a local game has nothing else on screen that says other
+# people could join it: -Mode Host is a switch nobody types, and a feature
+# nobody can find is not a feature.
+#
+# Three panels behind one entry point, because "who else is in this game" is
+# one question with three answers depending on where you are sitting.
+
+function Show-RonNetworkOverlay {
+    $App = (Get-RonApp)
+    if ($null -eq $App -or $null -eq $App.State) { return }
+    $App.Ui.NetPanelOpen = $true
+
+    $kind = 'Local'
+    if ($null -ne $App.Session) { $kind = [string]$App.Session.Kind }
+    if ($kind -eq 'Host')   { Show-RonHostingOverlay; return }
+    if ($kind -eq 'Client') { Show-RonJoinedOverlay;  return }
+    Show-RonOpenGameOverlay
+}
+
+# Redraws the panel under a live game. Somebody joining or dropping changes
+# every line of it, and a hosting panel that still says "waiting" after the
+# player has arrived is worse than no panel at all.
+function Sync-RonNetworkOverlay {
+    $App = (Get-RonApp)
+    if ($null -eq $App -or -not $App.Ui.NetPanelOpen) { return }
+    if (-not (Test-RonOverlayOpen -Ui $App.Ui)) { $App.Ui.NetPanelOpen = $false; return }
+    Show-RonNetworkOverlay
+}
+
+function New-RonNetNote {
+    param([Parameter(Mandatory)][hashtable]$Ui)
+    $note = New-Object System.Windows.Controls.TextBlock
+    $note.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $note.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
+    $note.Style = $Ui.Window.FindResource('Text.Dim')
+    return $note
+}
+
+function Set-RonNetNote {
+    param(
+        [Parameter(Mandatory)][hashtable]$Ui,
+        [Parameter(Mandatory)][System.Windows.Controls.TextBlock]$Note,
+        [string]$Text,
+        [switch]$Bad
+    )
+    $Note.Text = $Text
+    if ($Bad) { $Note.Foreground = $Ui.Window.FindResource('Brush.Danger') }
+    else      { $Note.Foreground = $Ui.Window.FindResource('Brush.Good') }
+}
+
+# One row per seat: the player in their own colour, and what that seat is
+# currently doing.
+function New-RonSeatRow {
+    param(
+        [Parameter(Mandatory)][hashtable]$Ui,
+        [Parameter(Mandatory)][GameState]$State,
+        [Parameter(Mandatory)][int]$PlayerId,
+        [System.Windows.UIElement]$Chip = $null,
+        [System.Windows.UIElement]$Trailing = $null
+    )
+    $row = New-RonRowGrid -Widths @('Auto','*','Auto')
+    if ($null -eq $Chip) { $Chip = New-RonPlayerChip -Ui $Ui -State $State -PlayerId $PlayerId }
+    # Each row is its own Grid, so an Auto column is only as wide as ITS
+    # content: without a floor the names, the descriptions and the buttons all
+    # start somewhere different on every line.
+    $Chip.MinWidth = 104
+    [System.Windows.Controls.Grid]::SetColumn($Chip, 0)
+    [void]$row.Children.Add($Chip)
+
+    $desc = New-RonLabel -Text (Get-RonSeatStatus -State $State -PlayerId $PlayerId) -Column 1 -Style 'Text.Dim' -Ui $Ui
+    $desc.Margin = New-Object System.Windows.Thickness(12, 0, 12, 0)
+    [void]$row.Children.Add($desc)
+
+    if ($null -ne $Trailing) {
+        $Trailing.MinWidth = 132
+        [System.Windows.Controls.Grid]::SetColumn($Trailing, 2)
+        [void]$row.Children.Add($Trailing)
+    }
+    return $row
+}
+
+# --- opening a local game --------------------------------------------------
+
+function Show-RonOpenGameOverlay {
+    $App = (Get-RonApp)
+    $Ui = $App.Ui
+    $state = $App.State
+
+    $card = New-RonOverlayCard -Ui $Ui -Title 'Play with other people' -Width 740 `
+        -Subtitle ('Open this game to your network and somebody on another computer can take a seat. ' +
+                   'Play carries on from exactly where it is - nothing restarts, nobody loses their position.')
+
+    $ids = @(Get-RonOpenableSeatIds -State $state)
+
+    # The chosen seats live in a hashtable rather than a plain variable: a
+    # closure that ASSIGNS writes to its own invocation scope, so $chosen += id
+    # inside a click handler is forgotten the moment the handler returns.
+    $pick = @{ Ids = @(); Draw = $null }
+    foreach ($id in $ids) {
+        # Default to a bot, never to the seat the person clicking is sitting in.
+        if ($state.Players[$id].Kind -eq 'AI') { $pick.Ids = @($id); break }
+    }
+
+    [void]$card.Body.Children.Add((New-RonHeading -Ui $Ui -Text 'SEATS TO HAND OVER'))
+    $body = New-RonScrollBody -MaxHeight 260
+    [void]$card.Body.Children.Add($body.Scroll)
+
+    $pick.Draw = {
+        # GetNewClosure copies the variables LOCAL to the scope it is called
+        # from. This scriptblock is ITSELF a closure, so the things it was
+        # built with belong to its own module rather than to this invocation -
+        # and a handler created below would capture none of them and read
+        # $null. Local aliases are something GetNewClosure can see and copy.
+        $bag = $pick
+        $body.Inner.Children.Clear()
+        foreach ($id in $ids) {
+            $chip = New-RonPlayerButton -Ui $Ui -State $state -PlayerId $id -Selected (@($bag.Ids) -contains $id)
+            $seat = $id
+            $chip.Add_Click({
+                if (@($bag.Ids) -contains $seat) { $bag.Ids = @(@($bag.Ids) | Where-Object { $_ -ne $seat }) }
+                else { $bag.Ids = @(@($bag.Ids) + $seat) }
+                & $bag.Draw
+            }.GetNewClosure())
+            [void]$body.Inner.Children.Add((New-RonSeatRow -Ui $Ui -State $state -PlayerId $id -Chip $chip))
+        }
+    }.GetNewClosure()
+    & $pick.Draw
+
+    $hint = New-RonLabel -Style 'Text.Dim' -Ui $Ui -Text (
+        'A bot plays an open seat until somebody claims it, so the table never sits waiting for anyone. ' +
+        'Whoever joins first takes the topmost open seat. You can hand your own seat over too - useful ' +
+        'when a hot-seat player would rather play from their own computer.')
+    $hint.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    [void]$card.Body.Children.Add($hint)
+
+    [void]$card.Body.Children.Add((New-RonHeading -Ui $Ui -Text 'CONNECTION' -Top 18))
+    $conn = New-RonRowGrid -Widths @('Auto','110','*')
+    [void]$conn.Children.Add((New-RonLabel -Text 'Port' -Column 0 -Style 'Text.Dim' -Ui $Ui))
+
+    $portBox = New-Object System.Windows.Controls.TextBox
+    $portBox.Text = [string](Get-RonDefaultPort)
+    $portBox.Margin = New-Object System.Windows.Thickness(12, 0, 16, 0)
+    [System.Windows.Controls.Grid]::SetColumn($portBox, 1)
+    [void]$conn.Children.Add($portBox)
+
+    $loop = New-Object System.Windows.Controls.CheckBox
+    $loop.Content = 'This computer only - for trying it out, and never asks the firewall'
+    $loop.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+    [System.Windows.Controls.Grid]::SetColumn($loop, 2)
+    [void]$conn.Children.Add($loop)
+    [void]$card.Body.Children.Add($conn)
+
+    $note = New-RonNetNote -Ui $Ui
+    $note.Text = 'The first time this listens on the network, Windows Defender asks about powershell.exe. Allow it, or nobody can connect.'
+    [void]$card.Body.Children.Add($note)
+
+    Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Open to the network' -Style 'Button.Primary' -OnClick {
+        if (@($pick.Ids).Count -eq 0) {
+            Set-RonNetNote -Ui $Ui -Note $note -Bad -Text 'Choose at least one seat to hand over - there is nowhere for anyone to sit otherwise.'
+            return
+        }
+        $port = 0
+        if (-not [int]::TryParse($portBox.Text.Trim(), [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            Set-RonNetNote -Ui $Ui -Note $note -Bad -Text 'A port is a whole number from 1 to 65535.'
+            return
+        }
+        $result = Open-RonAppToNetwork -SeatIds ([int[]]@($pick.Ids)) -Port $port -LoopbackOnly:([bool]$loop.IsChecked)
+        if (-not $result.Ok) {
+            Set-RonNetNote -Ui $Ui -Note $note -Bad -Text $result.Reason
+            return
+        }
+        # Straight on to the address the other players need, which is the only
+        # reason anybody pressed this button.
+        Show-RonNetworkOverlay
+    }.GetNewClosure() | Out-Null
+
+    Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Cancel' -OnClick {
+        Hide-RonOverlay -Ui (Get-RonApp).Ui
+    } | Out-Null
+
+    Show-RonOverlay -Ui $Ui -Content $card.Root -Modal
+}
+
+# --- hosting: what the other players need ----------------------------------
+
+function Show-RonHostingOverlay {
+    $App = (Get-RonApp)
+    $Ui = $App.Ui
+    $state = $App.State
+    $session = $App.Session
+
+    $card = New-RonOverlayCard -Ui $Ui -Title 'Other players can join' -Width 760 `
+        -Subtitle 'Read this out, or send it over. They run it from their own Ronopoly folder.'
+
+    # Big enough to read off a screen from across a room, which is exactly how
+    # this number gets used.
+    $addr = New-Object System.Windows.Controls.TextBlock
+    $addr.Text = "$($session.Address)  :  $($session.Port)"
+    $addr.FontSize = 34
+    $addr.FontWeight = [System.Windows.FontWeights]::Bold
+    $addr.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [void]$card.Body.Children.Add($addr)
+
+    # Selectable, so the line can be copied by hand on a machine where the
+    # clipboard is being held by something else.
+    $cmd = New-Object System.Windows.Controls.TextBox
+    $cmd.Text = Get-RonJoinCommand -Session $session
+    $cmd.IsReadOnly = $true
+    $cmd.FontFamily = New-Object System.Windows.Media.FontFamily 'Consolas'
+    $cmd.FontSize = 14
+    [void]$card.Body.Children.Add($cmd)
+
+    if ($session.Address -eq '127.0.0.1') {
+        $only = New-RonLabel -Style 'Text.Dim' -Ui $Ui -Text (
+            'Listening on this computer only. Another window on this machine can join; nothing on the network can.')
+        $only.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
+        [void]$card.Body.Children.Add($only)
+    }
+
+    [void]$card.Body.Children.Add((New-RonHeading -Ui $Ui -Text 'THE TABLE' -Top 18))
+    $body = New-RonScrollBody -MaxHeight 240
+    [void]$card.Body.Children.Add($body.Scroll)
+
+    $note = New-RonNetNote -Ui $Ui
+    [void]$card.Body.Children.Add($note)
+
+    $draw = @{ Rows = $null }
+    $draw.Rows = {
+        # GetNewClosure copies the variables LOCAL to the scope it is called
+        # from. This scriptblock is ITSELF a closure, so the things it was
+        # built with belong to its own module rather than to this invocation -
+        # and a handler created below would capture none of them and read
+        # $null. Local aliases are something GetNewClosure can see and copy.
+        $ui2 = $Ui
+        $line = $note
+        $st = (Get-RonApp).State
+        $body.Inner.Children.Clear()
+        foreach ($p in $st.Players) {
+            $trailing = $null
+            $id = $p.Id
+
+            if ($p.Kind -eq 'Remote' -and $p.ConnectionState -ne 'Connected' -and (Get-RonApp).OpenedSeats.ContainsKey($id)) {
+                $back = New-Object System.Windows.Controls.Button
+                $back.Content = 'Take back'
+                $back.Style = $Ui.Window.FindResource('Button.Row')
+                $back.Add_Click({
+                    $r = Close-RonAppSeat -PlayerId $id
+                    if (-not $r.Ok) { Set-RonNetNote -Ui $ui2 -Note $line -Bad -Text $r.Reason; return }
+                    Show-RonNetworkOverlay
+                }.GetNewClosure())
+                $trailing = $back
+            }
+            elseif ($p.Kind -ne 'Remote' -and -not $p.IsBankrupt) {
+                $open = New-Object System.Windows.Controls.Button
+                $open.Content = 'Open this seat'
+                $open.Style = $Ui.Window.FindResource('Button.Row')
+                $open.Add_Click({
+                    $r = Open-RonAppSeat -PlayerId $id
+                    if (-not $r.Ok) { Set-RonNetNote -Ui $ui2 -Note $line -Bad -Text $r.Reason; return }
+                    Show-RonNetworkOverlay
+                }.GetNewClosure())
+                $trailing = $open
+            }
+
+            [void]$body.Inner.Children.Add((New-RonSeatRow -Ui $Ui -State $st -PlayerId $id -Trailing $trailing))
+        }
+    }.GetNewClosure()
+    & $draw.Rows
+
+    Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Copy the join command' -Style 'Button.Primary' -OnClick {
+        try {
+            [System.Windows.Clipboard]::SetText($cmd.Text)
+            Set-RonNetNote -Ui $Ui -Note $note -Text 'Copied. Paste it into a PowerShell window on the other computer.'
+        }
+        catch {
+            # Another process can hold the clipboard open, and there is nothing
+            # to be done about it but say so - the line above is selectable.
+            Set-RonNetNote -Ui $Ui -Note $note -Bad -Text 'Windows would not release the clipboard. Select the line above and copy it by hand.'
+        }
+    }.GetNewClosure() | Out-Null
+
+    # Only offered when nobody is actually connected: closing the door on a
+    # player mid-game is a different decision, and it is not this button.
+    $connected = 0
+    foreach ($p in $state.Players) {
+        if ($p.Kind -eq 'Remote' -and $p.ConnectionState -eq 'Connected') { $connected++ }
+    }
+    if ($connected -eq 0) {
+        Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Stop hosting' -OnClick {
+            $r = Close-RonAppNetwork
+            if (-not $r.Ok) { Set-RonNetNote -Ui $Ui -Note $note -Bad -Text $r.Reason; return }
+            Hide-RonOverlay -Ui (Get-RonApp).Ui
+        }.GetNewClosure() | Out-Null
+    }
+
+    Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Back to the game' -OnClick {
+        Hide-RonOverlay -Ui (Get-RonApp).Ui
+    } | Out-Null
+
+    Show-RonOverlay -Ui $Ui -Content $card.Root -Modal
+}
+
+# --- joined: where you are and how it is going -----------------------------
+
+function Show-RonJoinedOverlay {
+    $App = (Get-RonApp)
+    $Ui = $App.Ui
+    $session = $App.Session
+
+    $card = New-RonOverlayCard -Ui $Ui -Title 'You are playing over the network' -Width 700 `
+        -Subtitle 'The host runs the rules; this window shows you what they decide.'
+
+    $status = 'connecting'
+    if ($session.Status -eq 'connected') { $status = 'connected' }
+    if ($session.Status -eq 'lost')      { $status = 'the host is no longer reachable' }
+    if ($session.Status -eq 'rejected')  { $status = 'the host turned the connection away' }
+
+    $lines = @("Status: $status")
+    if (@($session.LocalIds).Count -gt 0 -and $null -ne $App.State) {
+        $me = $App.State.Players[[int]@($session.LocalIds)[0]]
+        $lines += "You are $($me.Name), seat $($me.Id)."
+    }
+    foreach ($line in $lines) {
+        $tb = New-RonLabel -Text $line
+        $tb.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
+        [void]$card.Body.Children.Add($tb)
+    }
+
+    if ($null -ne $App.State) {
+        [void]$card.Body.Children.Add((New-RonHeading -Ui $Ui -Text 'THE TABLE' -Top 14))
+        $body = New-RonScrollBody -MaxHeight 240
+        [void]$card.Body.Children.Add($body.Scroll)
+        foreach ($p in $App.State.Players) {
+            [void]$body.Inner.Children.Add((New-RonSeatRow -Ui $Ui -State $App.State -PlayerId $p.Id))
+        }
+    }
+
+    Add-RonOverlayButton -Ui $Ui -Card $card -Label 'Back to the game' -Style 'Button.Primary' -OnClick {
         Hide-RonOverlay -Ui (Get-RonApp).Ui
     } | Out-Null
 

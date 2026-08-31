@@ -23,8 +23,10 @@ cascades, and a settings screen for the house rules everyone argues about.
 | Light theme, no animations | `.\Ronopoly.cmd -Theme Light -Fast` |
 | Silence | `.\Ronopoly.cmd -Mute` |
 | Host a LAN game | `.\Ronopoly.cmd -Mode Host` |
+| Host with room for three | `.\Ronopoly.cmd -Mode Host -Remote 3` |
 | Join one | `.\Ronopoly.cmd -Mode Join -HostAddress 192.168.1.42 -Name Ada` |
 | Two clients on one machine | `.\Ronopoly.cmd -Mode Host -LoopbackOnly` then `-Mode Join -HostAddress 127.0.0.1` |
+| Open a game already running | press the status strip under the game log |
 
 The launcher passes `-ExecutionPolicy Bypass -STA -NoProfile`. **Bypass**
 because this machine's LocalMachine policy is `Restricted`, which blocks `.ps1`
@@ -150,6 +152,31 @@ replay events into a local replica; a snapshot is ~20 KB and ~2 ms to build,
 which is nothing on a LAN, and it removes the largest correctness risk in the
 whole layer — a replay path that has to mirror the rules exactly and desyncs
 silently when it does not.
+
+**Opening a game already in progress.** The status strip under the game log is
+a button. Press it in any local game and it offers to hand chosen seats to
+people on your network; the panel that follows shows the address, the port and
+the exact command for the other player to run, with a button to copy it.
+
+Nothing restarts. A `Host` session is a `Local` session plus a listener over the
+*same* `GameState` object, so play carries on mid-turn, and a bot holds each
+opened seat until somebody claims it rather than the table stopping dead — which
+is exactly the state a *dropped* player's seat is left in, so the existing join
+path reclaims it with no new machinery. If hosting fails — a port already in
+use, a firewall saying no — every seat goes back the way it was found. The same
+panel takes an unclaimed seat back, or stops hosting entirely when nobody has
+joined.
+
+**Seats.** A game can only be joined if it has an *open seat* — one whose kind
+is `Remote`, which nobody at the host's keyboard plays. `-Mode Host` leaves one
+open by default; `-Remote 3` leaves three, taken from the bots' places so the
+table stays the same size. You can also set a seat to **Remote** on the New
+game screen. Without one, the host answers every joiner with *"this game is
+full"*, however well the sockets work.
+
+The strip reads out the address and port to pass to
+`-HostAddress`, and how many seats are still empty. It shows `127.0.0.1` when
+hosting `-LoopbackOnly`, because that is where the listener actually is.
 
 **Firewall.** The first time the game listens on a real network interface,
 Windows Defender will ask about `powershell.exe`. Allow it. If the prompt was
@@ -295,6 +322,16 @@ NORTHUMB AVE, so that is left alone; a single word snapping in half is not, so
 the longest *word* is measured and the type shrinks only far enough to fit it.
 Every name that already fits keeps the full size, which is why MARLBOROUGH is a
 point smaller than its neighbours and nothing else is.
+
+---
+
+## Licence
+
+GPL-3.0-or-later. The full text is in [LICENSE](LICENSE).
+
+Monopoly is a trademark of Hasbro. This is an independent implementation
+written for fun, and is not affiliated with or endorsed by the trademark
+holder.
 
 ---
 

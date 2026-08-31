@@ -45,6 +45,23 @@ function Find-TestButton {
     return $null
 }
 
+# The same walk, by type rather than by caption - for the controls a panel has
+# only one of.
+function Find-TestElement {
+    param([System.Windows.DependencyObject]$Root, [Type]$Type, [string]$Contains = '')
+    if ($null -eq $Root) { return $null }
+    if ($Type.IsInstanceOfType($Root)) {
+        if (-not $Contains) { return $Root }
+        if ([string]$Root.Text -like "*$Contains*") { return $Root }
+    }
+    $n = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($Root)
+    for ($i = 0; $i -lt $n; $i++) {
+        $hit = Find-TestElement -Root ([System.Windows.Media.VisualTreeHelper]::GetChild($Root, $i)) -Type $Type -Contains $Contains
+        if ($null -ne $hit) { return $hit }
+    }
+    return $null
+}
+
 function Invoke-TestClick {
     param([System.Windows.Controls.Button]$Button)
     $Button.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
@@ -163,6 +180,161 @@ Describe 'UI smoke' {
         Assert-Equal 1 $probe.PendingTo
         Assert-Equal 2 $probe.Chain
         Assert-True $probe.NoLongerModal 'the panel stayed modal after sending'
+    }
+
+    It 'opens a running game to the network from the status strip' {
+        # The status strip is the ONLY way in to network play from inside the
+        # game, so this drives it exactly as a player does: press the strip,
+        # tick loopback, press the button. Loopback keeps the firewall out of
+        # it - a Defender prompt in a test would hang the run.
+        Initialize-RonLog -Level Warn
+        Reset-RonErrors
+        $probe = @{}
+        $seats = @(
+            (New-RonSeat -Name 'You'   -Kind 'Human' -Token 'hat'),
+            (New-RonSeat -Name 'Ada'   -Kind 'AI' -AiProfile 'Normal' -Token 'car'),
+            (New-RonSeat -Name 'Blake' -Kind 'AI' -AiProfile 'Hard'   -Token 'ship')
+        )
+        Start-RonApp -Seats $seats -Seed 5150 -Theme Dark -Mute -FastMode -AutoCloseSeconds 25 -OnReady {
+            $App = (Get-RonApp)
+            $probe.StartedLocal = ($App.Session.Kind -eq 'Local')
+            # The caption has to carry the invitation. "Local game" on its own
+            # is a button nobody presses.
+            $probe.Caption = [string]$App.Ui.BtnNet.Content
+
+            Invoke-TestClick -Button $App.Ui.BtnNet
+            $App.Window.UpdateLayout()
+            $probe.PanelIsModal = (Test-RonOverlayModal -Ui $App.Ui)
+
+            # Choosing the seats, which is the whole point of the panel and the
+            # one thing a default selection would let a test skip. These chips
+            # are rebuilt on every click, so each has to be found again.
+            $blake = Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Blake'
+            $probe.FoundChip = ($null -ne $blake)
+            if ($null -ne $blake) { Invoke-TestClick -Button $blake }
+            $App.Window.UpdateLayout()
+            $probe.BlakeOn = ((Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Blake').Opacity -eq 1.0)
+            # And off again: Ada was chosen by default, so this un-chooses her.
+            $ada = Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Ada'
+            if ($null -ne $ada) { Invoke-TestClick -Button $ada }
+            $App.Window.UpdateLayout()
+            $probe.AdaOff = ((Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Ada').Opacity -lt 1.0)
+
+            $port = Find-TestElement -Root $App.Ui.OverlayHost -Type ([System.Windows.Controls.TextBox])
+            $probe.FoundPort = ($null -ne $port)
+            # A port of its own, so a stray listener on the default cannot make
+            # this test fail for a reason that has nothing to do with it.
+            if ($null -ne $port) { $port.Text = '27110' }
+
+            $loop = Find-TestElement -Root $App.Ui.OverlayHost -Type ([System.Windows.Controls.CheckBox])
+            $probe.FoundLoopback = ($null -ne $loop)
+            if ($null -ne $loop) { $loop.IsChecked = $true }
+
+            $open = Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Open to the network'
+            $probe.FoundOpen = ($null -ne $open)
+            if ($null -ne $open) { Invoke-TestClick -Button $open }
+            $App.Window.UpdateLayout()
+
+            $now = (Get-RonApp)
+            $probe.Kind = [string]$now.Session.Kind
+            $probe.Address = [string]$now.Session.Address
+            $probe.Port = [int]$now.Session.Port
+            # Seat 1 was the bot; it is now the chair a joiner claims, with the
+            # bot holding it so the table does not stop.
+            # Blake was chosen and Ada was un-chosen, so it is seat 2 that went
+            # and seat 1 that stayed - not whatever the panel happened to
+            # suggest when it opened.
+            $probe.SeatOpened = ($now.State.Players[2].Kind -eq 'Remote')
+            $probe.AdaKept = ($now.State.Players[1].Kind -eq 'AI')
+            $probe.BotHoldsIt = $now.State.Players[2].IsAiControlled()
+            $probe.HostDrivesIt = (Test-RonSessionControls -Session $now.Session -PlayerId 2)
+            $probe.Strip = [string]$now.Ui.BtnNet.Content
+            # And the panel now shows what the other player actually needs.
+            $cmd = Find-TestElement -Root $now.Ui.OverlayHost -Type ([System.Windows.Controls.TextBox]) -Contains '-Mode Join'
+            $probe.ShowsCommand = ($null -ne $cmd)
+            if ($null -ne $cmd) { $probe.Command = [string]$cmd.Text }
+
+            # Stop hosting again, so the test leaves no socket behind and the
+            # round trip is covered rather than only the way in.
+            $stop = Find-TestButton -Root $now.Ui.OverlayHost -Caption 'Stop hosting'
+            $probe.FoundStop = ($null -ne $stop)
+            if ($null -ne $stop) { Invoke-TestClick -Button $stop }
+            $probe.BackToLocal = ((Get-RonApp).Session.Kind -eq 'Local')
+            $probe.SeatRestored = ((Get-RonApp).State.Players[2].Kind -eq 'AI')
+
+            (Get-RonApp).ConfirmedClose = $true
+            (Get-RonApp).Window.Close()
+        }.GetNewClosure()
+
+        Assert-Equal 0 (Get-RonErrorCount) "an error was logged: $(Get-RonLastError)"
+        Assert-True $probe.StartedLocal   'the game did not start local'
+        Assert-True ($probe.Caption -like '*Invite*') "the strip only said '$($probe.Caption)'"
+        Assert-True $probe.PanelIsModal   'pressing the strip opened nothing'
+        Assert-True $probe.FoundChip      'the panel had no seat to choose'
+        Assert-True $probe.BlakeOn         'clicking a seat did not choose it'
+        Assert-True $probe.AdaOff          'clicking a chosen seat did not un-choose it'
+        Assert-True $probe.FoundPort      'the panel had no port box'
+        Assert-True $probe.FoundLoopback  'the panel had no this-computer-only option'
+        Assert-True $probe.FoundOpen      'the panel had no button to open the game'
+        Assert-Equal 'Host' $probe.Kind   'the game never opened to the network'
+        Assert-Equal '127.0.0.1' $probe.Address 'a loopback listener advertised a LAN address'
+        Assert-Equal 27110 $probe.Port    'the port typed into the panel was ignored'
+        Assert-True $probe.SeatOpened     'the seat that was clicked is not the one that opened'
+        Assert-True $probe.AdaKept        'a seat that was un-chosen was handed over anyway'
+        Assert-True $probe.BotHoldsIt     'the open seat would stop the game dead'
+        Assert-True $probe.HostDrivesIt   'nobody was left able to move the open seat'
+        Assert-True ($probe.Strip -like '*27110*') "the strip still said '$($probe.Strip)'"
+        Assert-True $probe.ShowsCommand   'the panel never showed the joining command'
+        Assert-True ($probe.Command -like '*127.0.0.1*') "the command read '$($probe.Command)'"
+        Assert-True $probe.FoundStop      'a game with nobody connected could not stop hosting'
+        Assert-True $probe.BackToLocal    'stopping hosting left the session hosted'
+        Assert-True $probe.SeatRestored   'the bot never got its seat back'
+    }
+
+    It 'aims a trade at the player whose chip was clicked' {
+        # The picker is built by a redraw closure that builds click handlers,
+        # and a handler built that way captures only what its own invocation
+        # made local. Get that wrong and the chips throw the instant they are
+        # pressed while the panel still looks perfectly correct - which is how
+        # this shipped broken. Pressing one is the only thing that proves it.
+        Initialize-RonLog -Level Warn
+        Reset-RonErrors
+        $probe = @{}
+        $seats = @(
+            (New-RonSeat -Name 'You'   -Kind 'Human' -Token 'hat'),
+            (New-RonSeat -Name 'Ada'   -Kind 'AI' -AiProfile 'Normal' -Token 'car'),
+            (New-RonSeat -Name 'Blake' -Kind 'AI' -AiProfile 'Hard'   -Token 'ship')
+        )
+        Start-RonApp -Seats $seats -Seed 8080 -Theme Dark -Mute -FastMode -AutoCloseSeconds 20 -OnReady {
+            $App = (Get-RonApp)
+            $App.State.Properties[1].OwnerId = 0
+            $App.State.Properties[13].OwnerId = 1
+            $App.State.Properties[15].OwnerId = 2
+
+            Show-RonTradeOverlay -FromId 0
+            $App.Window.UpdateLayout()
+            # Ada is offered first, so Blake is the one that has to be chosen.
+            $chip = Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Blake'
+            $probe.FoundChip = ($null -ne $chip)
+            if ($null -ne $chip) { Invoke-TestClick -Button $chip }
+            $App.Window.UpdateLayout()
+
+            $probe.BlakeChosen = ((Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Blake').Opacity -eq 1.0)
+            $probe.AdaDropped = ((Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Ada').Opacity -lt 1.0)
+            # The other side of the table is Blake's now, so his deed is what is
+            # on offer - the panel really rebuilt rather than only re-shading.
+            $probe.ShowsTheirDeed = ($null -ne (Find-TestButton -Root $App.Ui.OverlayHost -Caption 'Blake'))
+            $probe.Column = ($null -ne (Find-TestElement -Root $App.Ui.OverlayHost -Type ([System.Windows.Controls.CheckBox])))
+
+            (Get-RonApp).ConfirmedClose = $true
+            (Get-RonApp).Window.Close()
+        }.GetNewClosure()
+
+        Assert-Equal 0 (Get-RonErrorCount) "an error was logged: $(Get-RonLastError)"
+        Assert-True $probe.FoundChip   'the trade panel had no player to pick'
+        Assert-True $probe.BlakeChosen 'clicking a player did not aim the trade at them'
+        Assert-True $probe.AdaDropped  'the trade was still aimed at the first player as well'
+        Assert-True $probe.Column      'the other side of the table did not redraw'
     }
 
     It 'asks before closing, and closes when told to' {

@@ -120,6 +120,13 @@ function New-RonHostSession {
         return @{ Kind = 'Failed'; Error = $listener.LastError; Status = 'failed' }
     }
 
+    # Advertise the address actually being LISTENED on. Reading out the LAN
+    # address of a loopback-only listener sends the other player somewhere
+    # nothing is answering, in the very mode meant for testing two clients on
+    # one machine.
+    $address = Get-RonLocalAddress
+    if ($LoopbackOnly) { $address = '127.0.0.1' }
+
     return @{
         Kind      = 'Host'
         State     = $State
@@ -129,11 +136,50 @@ function New-RonHostSession {
         LocalIds  = $LocalIds
         Status    = 'listening'
         Port      = $listener.Port
-        Address   = (Get-RonLocalAddress)
+        Address   = $address
         Seq       = 0
         Tokens    = @{}      # session token -> player id, for reconnects
         Pending   = New-Object System.Collections.Queue
     }
+}
+
+# Opens a game that is ALREADY RUNNING to the network.
+#
+# The state object is handed straight to the host session - not copied, not
+# migrated, not restarted - so play continues from exactly where it is, mid-turn
+# included. That is only possible because Host is Local plus a listener: there
+# is no separate "networked game" to move to.
+function Open-RonSessionToNetwork {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [int]$Port = 0,
+        [switch]$LoopbackOnly
+    )
+    if ($Session.Kind -eq 'Host') { return $Session }
+    if ($Session.Kind -ne 'Local') {
+        return @{ Kind = 'Failed'; Error = 'Only a local game can be opened to the network.'; Status = 'failed' }
+    }
+    if ($null -eq $Session.State) {
+        return @{ Kind = 'Failed'; Error = 'There is no game to open.'; Status = 'failed' }
+    }
+
+    $opened = New-RonHostSession -State $Session.State -LocalIds (Get-RonHostLocalIds -State $Session.State) `
+        -Port $Port -LoopbackOnly:$LoopbackOnly
+    if ($opened.Kind -eq 'Failed') { return $opened }
+
+    Close-RonSession -Session $Session
+    return $opened
+}
+
+# The reverse: stop listening and go back to a game on this machine alone. The
+# caller is responsible for putting the opened SEATS back - closing the socket
+# says nothing about who is meant to be sitting in them.
+function Close-RonSessionNetwork {
+    param([Parameter(Mandatory)][hashtable]$Session)
+    if ($Session.Kind -ne 'Host') { return $Session }
+    $state = $Session.State
+    Close-RonSession -Session $Session
+    return (New-RonLocalSession -State $state)
 }
 
 # --- joining ---------------------------------------------------------------
@@ -254,6 +300,13 @@ function Receive-RonHostMessage {
             $player.Kind = 'Remote'
             $player.ConnectionState = 'Connected'
             $player.SessionToken = $token
+
+            # The seat is theirs now, so this machine stops driving it.
+            # LocalIds is DERIVED from the state rather than edited in place:
+            # without this the host kept the seat it had been holding for them,
+            # so the AI carried on playing it and the host's own action panel
+            # lit up on the joiner's turn.
+            $Session.LocalIds = Get-RonHostLocalIds -State $Session.State
 
             Send-RonFrame -Connection $Peer -Message (New-RonWelcomeMessage -PlayerId $seat -GameId $Session.State.GameId -SessionToken $token)
             Send-RonFrame -Connection $Peer -Message (New-RonFullStateMessage -State $Session.State)
